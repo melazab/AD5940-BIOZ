@@ -52,10 +52,21 @@ typedef struct {
     volatile uint16_t CTL;
              uint16_t _rsvd2;
     volatile uint16_t RESTART;
+             uint16_t _rsvd3[5];
+    volatile const uint16_t STAT;
 } WDT_TypeDef;
 
 #define WDT0 ((WDT_TypeDef *)0x40002C00u)
 #define WDT_CTL_EN (1u << 5)
+/* WDT0 runs on its own (LFCLK-derived) clock domain, separate from the
+ * CPU's -- a write to LOAD/CTL/RESTART takes a few WDT clock cycles to
+ * actually land, and STAT's corresponding bit stays set until it does
+ * (cross-checked against mbed-os's own ADuCM3029 WDT driver, which polls
+ * these same bits before/after each such write). */
+#define WDT_STAT_CLRIRQ   (1u << 1) /* RESTART write sync in progress */
+#define WDT_STAT_LOADING  (1u << 2) /* LOAD write sync in progress */
+#define WDT_STAT_COUNTING (1u << 3) /* CTL write sync in progress */
+#define WDT_RESTART_KEY 0xCCCCu     /* value that actually kicks/reloads it */
 
 /* ---- Clock oscillator control (CLKG0_OSC) ----
  * Selects/enables the high-frequency crystal that the ADICUP3029 board's

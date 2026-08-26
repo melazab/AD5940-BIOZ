@@ -6,6 +6,72 @@
 #include <stdio.h>
 #include <string.h>
 
+/* STATUS: unverified. The while(1) hang below is confirmed real; that a
+ * watchdog reset actually recovers from it is NOT -- the one hardware test
+ * run so far (a deliberately-provoked HP-mode hang, watched for 5+ minutes)
+ * showed no reboot banner and no recovery at all, despite the ~8s timeout
+ * WatchdogArm() sets below. Cause not yet root-caused: candidates include a
+ * WDT lock/latch this code doesn't know to clear, the DIV256-prescaler
+ * assumption being wrong (making the real timeout far longer than 8s), or
+ * the CTL write silently not taking effect. A register-readback diagnostic
+ * (print WDT0->CTL/LOAD/STAT right after WatchdogArm()) was queued but not
+ * yet run. Don't trust this to actually save you from a hang until that's
+ * resolved and re-tested.
+ *
+ * Re-armed at the end of MCU_ClockAndUartInit() (which first disables the
+ * watchdog the ADuCM3029 boots with already running) as a safety net
+ * against ad5940lib's own AD5940_Initialize() -- confirmed on real
+ * hardware: it does a bare `while(1);` if the AD5940's chip-ID readback
+ * ever comes back as anything other than the three values it recognizes
+ * (ad5940lib/ad5940.c, in the CHIPID check at the end of
+ * AD5940_Initialize()). A bad SPI/hibernate-wake state left over from a
+ * prior HP-mode run reproduced this: the chip-ID read came back garbage
+ * (0x8055), the firmware hit that while(1), and it stayed completely
+ * unresponsive -- the ADuCM3029 itself was still running (confirmed via
+ * OpenOCD: halting it landed inside AD5940_CsSet, a single-instruction GPIO
+ * write with no loop of its own, which is only reachable while the CPU is
+ * actively executing, i.e. not a Default_Handler-style fault) -- until
+ * physically power-cycled. A watchdog reset recovers from that (and any
+ * other hang in vendored code this project doesn't control) automatically
+ * within seconds instead of requiring physical intervention.
+ *
+ * Only the EN bit is ever touched (both here and in the original disable
+ * below) -- PRE/MODE/IRQ are left exactly as the chip's own power-on
+ * defaults left them, which are presumably already "reset (not just
+ * interrupt) on timeout", since that's the evident point of a watchdog
+ * that's already running before any user code gets to configure it.
+ * WatchdogArm()'s LOAD value picks the actual timeout (see its own
+ * comment); DIV256 -- confirmed via ADI's own mbed-os WDT driver as this
+ * peripheral's POR-default prescaler -- is assumed for that math, again
+ * because it's never written here.
+ *
+ * WatchdogKick() must be called often enough that the *longest single
+ * uninterruptible step* between two kicks -- not the cumulative time of a
+ * whole run -- stays under the timeout: see call sites in UartReadLine()
+ * (waiting on a command), right before AD5940_HWReset() (a fresh budget
+ * for the whole reset+init+RTIA-cal setup sequence, whose worst-case
+ * duration isn't characterized), and once per iteration of both the
+ * zero-baseline capture loop and the measurement loop. */
+static void WatchdogKick(void) {
+  while ((WDT0->STAT & WDT_STAT_CLRIRQ) != 0) {
+  }
+  WDT0->RESTART = WDT_RESTART_KEY;
+}
+
+static void WatchdogArm(void) {
+  while ((WDT0->STAT & WDT_STAT_LOADING) != 0) {
+  }
+  /* ~8s at DIV256 / ~32kHz (65535 max at this prescale is ~512s) --
+   * comfortably longer than any single operation measured on real hardware
+   * so far (worst case ~46ms/sample in HP mode), short enough that a
+   * genuine hang recovers in single-digit seconds rather than needing a
+   * physical power cycle. */
+  WDT0->LOAD = 1024;
+  while ((WDT0->STAT & WDT_STAT_COUNTING) != 0) {
+  }
+  WDT0->CTL |= WDT_CTL_EN;
+}
+
 /* ADuCM3029 MCU bring-up: disable the watchdog, switch the system clock to
  * the board's 26MHz crystal (matches ADI's own ADICUP3029 reference --
  * confirmed by AD5940_Delay10us()'s SYSTICK_CLK_FREQ_HZ needing to agree
@@ -56,12 +122,22 @@ static void MCU_ClockAndUartInit(void) {
     UART0->FCR |= UART_FCR_RFCLR | UART_FCR_TFCLR;
     UART0->FCR &= (uint16_t)~(UART_FCR_RFCLR | UART_FCR_TFCLR);
   }
+
+  WatchdogArm();
 }
 
 static void UartPutc(char c) {
   while ((UART0->LSR & UART_LSR_THRE) == 0) {
   }
   UART0->TX = (uint16_t)c;
+}
+
+/* Raw byte write, bypassing _write's LF->CRLF translation -- binary frame
+ * bytes must go out exactly as given, not filtered as if they were text. */
+static void UartWriteRaw(const uint8_t *buf, unsigned len) {
+  for (unsigned i = 0; i < len; i++) {
+    UartPutc((char)buf[i]);
+  }
 }
 
 int _write(int file, char *ptr, int len) {
@@ -88,6 +164,7 @@ static void UartReadLine(char *buf, unsigned bufsize) {
 
   for (;;) {
     while ((UART0->LSR & UART_LSR_DR) == 0) {
+      WatchdogKick(); /* sitting at the prompt is normal, not a hang */
     }
     char c = (char)UART0->RX;
 
@@ -311,8 +388,59 @@ static fImpCar_Type zero_baseline;
 static float zero_baseline_freq = 0.0f;
 static int have_zero_baseline = 0;
 
+/* Binary sample frame -- see gui/main.py's parse_sample_frame() for the
+ * matching decoder. Replaces the old printf("...%.2f...", ...)-per-sample
+ * text format: at BIOZODR=200Hz, a long continuous run means tens of
+ * thousands of printf float conversions (dtoa mallocs scratch space
+ * internally -- see startup.c's _sbrk() comment), against a 4KB heap that
+ * has no way to give memory back to _sbrk(). newlib's malloc/free do reuse
+ * freed blocks via their own freelist, but dtoa's scratch size varies with
+ * each float's digit count, so a small heap doing tens of thousands of
+ * differently-sized alloc/free cycles can eventually fragment past the
+ * point where some later request can be satisfied. Confirmed on hardware:
+ * two separate runs went permanently silent (no crash message, no reboot
+ * banner -- every Cortex-M3 fault handler here is aliased to
+ * Default_Handler's `while(1){}`) at two different sample counts (17265,
+ * then 30586) -- ruling out a fixed/deterministic bug and pointing at
+ * fragmentation timing that depends on the actual noise in each run's float
+ * values. Sending raw fields as bytes instead means nothing in the
+ * per-sample path calls malloc.
+ *
+ * Layout (16 bytes, little-endian to match both the ADuCM3029 and an x86
+ * receiver -- no byte-swap needed):
+ *   [0:2)   sync = 0xAA, 0x55 (never appears in this firmware's plain-text
+ *           banner/prompt output, so a receiver can always tell frame from
+ *           text without a separate out-of-band mode switch)
+ *   [2:6)   sample_num, uint32
+ *   [6]     flags: bit0 = apply_baseline (matches the old " (uncalibrated
+ *           -- run 'zero <Hz>' first)" text suffix)
+ *   [7:11)  real, float32
+ *   [11:15) imag, float32
+ *   [15]    checksum: XOR of bytes [0:15)
+ * Frequency isn't included -- it's fixed for the whole 'start <Hz>' run, so
+ * the receiver already has it from when it sent that command. */
+static void SendSampleBinary(uint32_t sample_num, float real, float imag,
+                              int apply_baseline) {
+  uint8_t frame[16];
+
+  frame[0] = 0xAA;
+  frame[1] = 0x55;
+  memcpy(&frame[2], &sample_num, sizeof(sample_num));
+  frame[6] = (uint8_t)(apply_baseline ? 1 : 0);
+  memcpy(&frame[7], &real, sizeof(real));
+  memcpy(&frame[11], &imag, sizeof(imag));
+
+  uint8_t chk = 0;
+  for (unsigned i = 0; i < 15; i++) {
+    chk ^= frame[i];
+  }
+  frame[15] = chk;
+
+  UartWriteRaw(frame, sizeof(frame));
+}
+
 static void PrintSample(uint32_t *pData, uint32_t DataCount, uint32_t *pSampleNum,
-                         float freq, int apply_baseline) {
+                         int apply_baseline) {
   fImpCar_Type *pImp = (fImpCar_Type *)pData;
 
   for (uint32_t i = 0; i < DataCount; i++, (*pSampleNum)++) {
@@ -321,11 +449,7 @@ static void PrintSample(uint32_t *pData, uint32_t DataCount, uint32_t *pSampleNu
       z.Real -= zero_baseline.Real;
       z.Image -= zero_baseline.Image;
     }
-    float mag = AD5940_ComplexMag(&z);
-    float phase_deg = AD5940_ComplexPhase(&z) * 180.0f / MATH_PI;
-    printf("sample=%lu freq=%.1fHz Z=(%.2f,%.2f)ohm |Z|=%.2fohm phase=%.2fdeg%s\n",
-           (unsigned long)*pSampleNum, freq, z.Real, z.Image, mag, phase_deg,
-           apply_baseline ? "" : " (uncalibrated -- run 'zero <Hz>' first)");
+    SendSampleBinary(*pSampleNum, z.Real, z.Image, apply_baseline);
   }
 }
 
@@ -370,6 +494,7 @@ int main(void) {
      * clean, freshly-reset state) was producing a baseline offset on the
      * second and later runs despite the first run after flashing being
      * correct (see time-series-bioz's identical fix for the 4-wire case). */
+    WatchdogKick(); /* fresh budget going into reset+init+RTIA-cal below */
     AD5940_HWReset();
     AD5940PlatformCfg();
 
@@ -390,6 +515,7 @@ int main(void) {
       float sum_real = 0.0f, sum_image = 0.0f;
       uint32_t got = 0;
       while (got < ZERO_SAMPLES) {
+        WatchdogKick();
         count = sizeof(app_buff) / sizeof(app_buff[0]);
         AppBIOZISR(app_buff, &count);
         fImpCar_Type *pImp = (fImpCar_Type *)app_buff;
@@ -411,10 +537,11 @@ int main(void) {
     } else {
       uint32_t sample_num = 0; /* starts back at 0 on every fresh 'start' */
       for (;;) {
+        WatchdogKick();
         count = sizeof(app_buff) / sizeof(app_buff[0]);
         AppBIOZISR(app_buff, &count);
         if (count > 0) {
-          PrintSample(app_buff, count, &sample_num, freq_reported, apply_baseline);
+          PrintSample(app_buff, count, &sample_num, apply_baseline);
         }
         if (UartPollLine(line, sizeof(line)) && strcmp(line, "stop") == 0) {
           AppBIOZCtrl(BIOZCTRL_STOPNOW, 0);

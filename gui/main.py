@@ -11,9 +11,13 @@ The plot switches between a frequency sweep view and a vs.-sample-number
 time-series view automatically based on which line format is actually
 coming in.
 """
+import math
+import os
 import queue
 import re
+import struct
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from collections import deque
@@ -23,6 +27,7 @@ from tkinter import ttk, scrolledtext
 import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from serial.tools import list_ports
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -45,14 +50,9 @@ FIRMWARE_DIRS = [
 TIME_SERIES_FIRMWARES = {"time-series-bioz", "time-series-bioz-2wire"}
 TIME_SERIES_2WIRE_FIRMWARE = "time-series-bioz-2wire"
 
-# time-series-bioz prints "sample=N freq=...Hz Z=(...)..." -- checked first
-# since it's a superset of the sweep line format below (which just starts
-# at "freq="). Sweep firmwares (measure-*-bioz) never print a "sample="
-# prefix, so there's no ambiguity between the two.
-TIME_SERIES_LINE_RE = re.compile(
-    r"sample=(\d+)\s+freq=([\d.eE+-]+)Hz\s+Z=\(([-\d.eE+]+),([-\d.eE+]+)\)ohm\s+"
-    r"\|Z\|=([\d.eE+-]+)ohm\s+phase=([-\d.eE+]+)deg"
-)
+# Sweep firmwares (measure-*-bioz) print "freq=...Hz Z=(...)..." lines --
+# the time-series firmwares send per-sample data as binary frames instead
+# (see SAMPLE_FRAME_SYNC/parse_sample_frame below), not as text.
 DATA_LINE_RE = re.compile(
     r"freq=([\d.eE+-]+)Hz\s+Z=\(([-\d.eE+]+),([-\d.eE+]+)\)ohm\s+"
     r"\|Z\|=([\d.eE+-]+)ohm\s+phase=([-\d.eE+]+)deg"
@@ -65,7 +65,8 @@ TIME_SERIES_MAXLEN = 300
 
 
 def find_daplink_device():
-    """Returns the DAPLink block device name (e.g. 'sda'), or None."""
+    """Returns the DAPLink block device name (e.g. 'sda'), or None. Linux only
+    -- see find_daplink_mount_windows for the Windows equivalent."""
     out = subprocess.run(
         ["lsblk", "-o", "NAME,LABEL", "-nr"], capture_output=True, text=True
     ).stdout
@@ -87,10 +88,88 @@ def find_mountpoint(device):
     return None
 
 
+def find_daplink_mount_windows():
+    """Returns the DAPLink drive root (e.g. 'D:\\\\'), or None. DAPLink shows
+    up as a normal removable drive on Windows -- no lsblk/udisksctl
+    equivalent exists, so this scans drive letters for the volume label
+    instead (stdlib ctypes only, no extra dependency)."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    bitmask = kernel32.GetLogicalDrives()
+    for i in range(26):
+        if not (bitmask & (1 << i)):
+            continue
+        drive = f"{chr(65 + i)}:\\"
+        name_buf = ctypes.create_unicode_buffer(261)
+        # Non-zero return means the call succeeded; GetVolumeInformationW
+        # can fail/hang-free-return-False for e.g. an empty CD drive.
+        ok = kernel32.GetVolumeInformationW(
+            drive, name_buf, len(name_buf), None, None, None, None, 0
+        )
+        if ok and name_buf.value == "DAPLINK":
+            return drive
+    return None
+
+
+def list_serial_ports():
+    """Sorted device names (e.g. ['COM3'] on Windows, ['/dev/ttyACM0'] on
+    Linux) of currently connected serial ports, via pyserial's own
+    cross-platform enumeration."""
+    return sorted(p.device for p in list_ports.comports())
+
+
+# ARM/Mbed's registered USB vendor ID -- what the ADICUP3029's DAPLink CDC
+# UART enumerates under. Used to pick a sane default port: alphabetically-
+# first isn't good enough on a machine with other serial hardware attached
+# (seen in the wild: an unrelated lab instrument claiming the lower COM#).
+DAPLINK_HWID_MARKER = "VID:PID=0D28"
+
+
+def find_daplink_serial_port():
+    """Returns the DAPLink board's own serial device name, or None if no
+    port matches the expected vendor ID."""
+    for p in list_ports.comports():
+        if p.hwid and DAPLINK_HWID_MARKER in p.hwid.upper():
+            return p.device
+    return None
+
+
+# The two time-series firmwares stream per-sample data as fixed-size binary
+# frames instead of a printf'd text line -- see time-series-bioz-2wire/
+# main.c's SendSampleBinary for the full rationale (printf's float
+# formatting mallocs scratch space per call, which fragmented that
+# firmware's 4KB heap and hung it after a few tens of thousands of
+# samples). Everything else those firmwares print (banner, prompts, "Zero
+# calibration captured...", "Stopped.") is still plain newline-terminated
+# text, so the two are told apart by SYNC, which never appears in that text
+# output -- see SerialReader.run().
+SAMPLE_FRAME_SYNC = b"\xaa\x55"
+SAMPLE_FRAME_LEN = 16
+
+
+def parse_sample_frame(frame):
+    """Decodes one SAMPLE_FRAME_LEN-byte binary sample frame (layout
+    documented in SendSampleBinary). Returns (sample_num, real, imag,
+    apply_baseline), or None if the checksum doesn't match."""
+    checksum = 0
+    for b in frame[:15]:
+        checksum ^= b
+    if checksum != frame[15]:
+        return None
+    sample_num = struct.unpack_from("<I", frame, 2)[0]
+    apply_baseline = bool(frame[6] & 1)
+    real, imag = struct.unpack_from("<ff", frame, 7)
+    return sample_num, real, imag, apply_baseline
+
+
 class SerialReader(threading.Thread):
-    """Reads lines from an open serial port into a queue. One line per queue
-    item; the GUI thread drains it via Tk's .after() polling loop, since Tk
-    isn't thread-safe to touch directly from here."""
+    """Reads from an open serial port into a queue, as ("line", text) for
+    plain newline-terminated text or ("sample", parsed) for a binary sample
+    frame (see parse_sample_frame) -- the two are mixed on the same wire for
+    the time-series firmwares. The GUI thread drains the queue via Tk's
+    .after() polling loop, since Tk isn't thread-safe to touch directly from
+    here."""
 
     def __init__(self, ser, out_queue):
         super().__init__(daemon=True)
@@ -113,9 +192,34 @@ class SerialReader(threading.Thread):
             if not chunk:
                 continue
             buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                self.out_queue.put(line.decode(errors="replace").rstrip("\r"))
+            while True:
+                sync_idx = buf.find(SAMPLE_FRAME_SYNC)
+                nl_idx = buf.find(b"\n")
+                if sync_idx != -1 and (nl_idx == -1 or sync_idx < nl_idx):
+                    if len(buf) < sync_idx + SAMPLE_FRAME_LEN:
+                        break  # rest of the frame hasn't arrived yet
+                    if sync_idx > 0:
+                        # Leftover bytes before the frame with no
+                        # terminating newline yet -- firmware only ever
+                        # starts a frame right after a complete printf'd
+                        # line, so this shouldn't normally happen, but
+                        # surface it rather than silently dropping it.
+                        leftover = buf[:sync_idx].decode(errors="replace")
+                        if leftover:
+                            self.out_queue.put(("line", leftover))
+                    frame = buf[sync_idx:sync_idx + SAMPLE_FRAME_LEN]
+                    buf = buf[sync_idx + SAMPLE_FRAME_LEN:]
+                    sample = parse_sample_frame(frame)
+                    if sample is not None:
+                        self.out_queue.put(("sample", sample))
+                    continue
+                if nl_idx != -1:
+                    line, buf = buf[:nl_idx], buf[nl_idx + 1:]
+                    self.out_queue.put(
+                        ("line", line.decode(errors="replace").rstrip("\r"))
+                    )
+                    continue
+                break
 
     def stop(self):
         self.stop_flag.set()
@@ -138,6 +242,11 @@ class App(tk.Tk):
         self.ts_sample = deque(maxlen=TIME_SERIES_MAXLEN)
         self.ts_mag = deque(maxlen=TIME_SERIES_MAXLEN)
         self.ts_phase = deque(maxlen=TIME_SERIES_MAXLEN)
+
+        # Sample frames don't carry frequency (it's fixed for the whole
+        # 'start <Hz>' run) -- set from freq_var whenever a run starts, used
+        # to reconstruct a readable log line for each incoming frame.
+        self._active_freq = 0.0
 
         # Which buffers/axis-scale _redraw() should use; switched
         # automatically the moment a line in the other format arrives (see
@@ -169,10 +278,16 @@ class App(tk.Tk):
         self.build_btn.pack(side="left", padx=(0, 20))
 
         ttk.Label(top, text="Serial port:").pack(side="left")
-        self.port_var = tk.StringVar(value="/dev/ttyACM0")
-        ttk.Entry(top, textvariable=self.port_var, width=16).pack(
-            side="left", padx=(4, 8)
-        )
+        self.port_var = tk.StringVar()
+        self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=16)
+        # Editable (not "readonly"): list_serial_ports() covers the normal
+        # case, but a manual path/COM# still works if a port doesn't
+        # enumerate for some reason. postcommand re-scans right before the
+        # dropdown opens, so newly plugged-in boards show up without a
+        # separate refresh button.
+        self.port_combo.configure(postcommand=self._refresh_ports)
+        self.port_combo.pack(side="left", padx=(4, 8))
+        self._refresh_ports()
         self.connect_btn = ttk.Button(
             top, text="Connect", command=self._on_connect_toggle
         )
@@ -241,6 +356,14 @@ class App(tk.Tk):
 
     # ---- logging helper ----
     def _log(self, text):
+        # _build_flash_worker_inner calls this from a background thread, and
+        # Tk isn't thread-safe on Windows -- calls made off the main thread
+        # observably raced/dropped frames (a "Flash complete" line took
+        # several seconds and extra redraws to actually appear). Marshal
+        # through .after() whenever we're not already on the main thread.
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self._log, text)
+            return
         self.log.insert("end", text + "\n")
         self.log.see("end")
 
@@ -250,6 +373,12 @@ class App(tk.Tk):
         threading.Thread(target=self._build_flash_worker, daemon=True).start()
 
     def _build_flash_worker(self):
+        try:
+            self._build_flash_worker_inner()
+        finally:
+            self.after(0, lambda: self.build_btn.config(state="normal"))
+
+    def _build_flash_worker_inner(self):
         name = self.firmware_var.get()
         project_dir = PROJECT_ROOT / name
         target = name.replace("-", "_")
@@ -260,42 +389,76 @@ class App(tk.Tk):
         self._log(proc.stdout + proc.stderr)
         if proc.returncode != 0:
             self._log("Build failed, not flashing.")
-            self.after(0, lambda: self.build_btn.config(state="normal"))
             return
 
-        device = find_daplink_device()
-        if device is None:
-            self._log("DAPLink device (label DAPLINK) not found via lsblk.")
-            self.after(0, lambda: self.build_btn.config(state="normal"))
-            return
-        mount = find_mountpoint(device)
-        if not mount:
-            self._log(f"Mounting /dev/{device} ...")
-            r = subprocess.run(
-                ["udisksctl", "mount", "-b", f"/dev/{device}"],
-                capture_output=True, text=True,
-            )
-            self._log(r.stdout + r.stderr)
+        if sys.platform == "win32":
+            mount = find_daplink_mount_windows()
+            if not mount:
+                self._log("DAPLink drive (volume label DAPLINK) not found.")
+                return
+        else:
+            device = find_daplink_device()
+            if device is None:
+                self._log("DAPLink device (label DAPLINK) not found via lsblk.")
+                return
             mount = find_mountpoint(device)
-        if not mount:
-            self._log("Could not determine DAPLink mount point.")
-            self.after(0, lambda: self.build_btn.config(state="normal"))
-            return
+            if not mount:
+                self._log(f"Mounting /dev/{device} ...")
+                r = subprocess.run(
+                    ["udisksctl", "mount", "-b", f"/dev/{device}"],
+                    capture_output=True, text=True,
+                )
+                self._log(r.stdout + r.stderr)
+                mount = find_mountpoint(device)
+            if not mount:
+                self._log("Could not determine DAPLink mount point.")
+                return
+            mount = mount + "/"
 
         bin_path = project_dir / f"{target}.bin"
+        dest_path = Path(mount) / bin_path.name
         self._log(f"Copying {bin_path.name} to {mount} ...")
-        subprocess.run(["cp", str(bin_path), mount + "/"], check=False)
-        subprocess.run(["sync"], check=False)
+        # Write + explicit fsync instead of shelling out to cp/sync (the
+        # latter doesn't exist on Windows) -- a plain copy can return before
+        # the data actually leaves the OS cache over USB, in which case
+        # DAPLink never sees a complete file and silently keeps running
+        # whatever was flashed before. fsync forces it out for real, on
+        # both platforms.
+        with open(bin_path, "rb") as fsrc, open(dest_path, "wb") as fdst:
+            fdst.write(fsrc.read())
+            fdst.flush()
+            os.fsync(fdst.fileno())
 
         self._log("Resetting target via OpenOCD ...")
-        proc = subprocess.run(
-            ["openocd", "-f", "openocd/aducm3029.cfg", "-c", "init",
-             "-c", "reset run", "-c", "resume", "-c", "shutdown"],
-            cwd=project_dir, capture_output=True, text=True,
-        )
-        self._log(proc.stdout + proc.stderr)
+        try:
+            # "reset run" already leaves the core running -- a trailing
+            # "resume" on top of that isn't a no-op, it errors ("not
+            # halted", "context restore failed, aborting resume") because
+            # resume expects a halted core. Confirmed on real hardware: with
+            # "resume" included, the target came up unresponsive (no UART
+            # output at all) after a flash; dropping it fixed that.
+            proc = subprocess.run(
+                ["openocd", "-f", "openocd/aducm3029.cfg", "-c", "init",
+                 "-c", "reset run", "-c", "shutdown"],
+                cwd=project_dir, capture_output=True, text=True,
+            )
+            self._log(proc.stdout + proc.stderr)
+        except FileNotFoundError:
+            self._log(
+                "openocd not found on PATH -- flash was written, but the "
+                "target wasn't reset via SWD. It may still auto-reset on "
+                "its own (DAPLink briefly unmounts/remounts on a real "
+                "flash); power-cycle or press the board's reset button if "
+                "it doesn't come up running the new image."
+            )
         self._log("=== Flash complete ===")
-        self.after(0, lambda: self.build_btn.config(state="normal"))
+
+    # ---- serial port dropdown ----
+    def _refresh_ports(self):
+        ports = list_serial_ports()
+        self.port_combo["values"] = ports
+        if not self.port_var.get() and ports:
+            self.port_var.set(find_daplink_serial_port() or ports[0])
 
     # ---- serial connect/disconnect ----
     def _on_connect_toggle(self):
@@ -375,6 +538,7 @@ class App(tk.Tk):
             self._log(f"Not a valid frequency: {self.freq_var.get()!r}")
             return
         self.title(f"AD5940-BIOZ — {freq:.0f} Hz")
+        self._active_freq = freq
         self._send(f"start {freq:.0f}")
 
     def _send(self, command):
@@ -397,24 +561,31 @@ class App(tk.Tk):
         redraw_needed = False
         while True:
             try:
-                line = self.line_queue.get_nowait()
+                kind, payload = self.line_queue.get_nowait()
             except queue.Empty:
                 break
-            self._log(line)
 
-            m = TIME_SERIES_LINE_RE.search(line)
-            if m:
-                sample, _freq, _real, _imag, mag, phase = (
-                    float(x) for x in m.groups()
+            if kind == "sample":
+                sample_num, real, imag, apply_baseline = payload
+                mag = math.hypot(real, imag)
+                phase = math.degrees(math.atan2(imag, real))
+                suffix = "" if apply_baseline else " (uncalibrated -- run 'zero' first)"
+                self._log(
+                    f"sample={sample_num} freq={self._active_freq:.1f}Hz "
+                    f"Z=({real:.2f},{imag:.2f})ohm |Z|={mag:.2f}ohm "
+                    f"phase={phase:.2f}deg{suffix}"
                 )
                 if self.plot_mode != "timeseries":
                     self.plot_mode = "timeseries"
                     self._configure_axes()
-                self.ts_sample.append(sample)
+                self.ts_sample.append(sample_num)
                 self.ts_mag.append(mag)
                 self.ts_phase.append(phase)
                 redraw_needed = True
                 continue
+
+            line = payload
+            self._log(line)
 
             m = DATA_LINE_RE.search(line)
             if m:
