@@ -320,37 +320,51 @@ static void TimeSeriesStructInit(float freq_hz) {
   cfg->SweepCfg.SweepEn = bFALSE;
   cfg->SinFreq = freq_hz;
 
-  /* DFTNUM_512 (down from bioz_2wire.c's default DFTNUM_8192): each
-   * measurement point runs two sequential DFTs (current, then voltage --
-   * see bioz_2wire.c's AppBIOZSeqCfgGen), each taking DftNum/SincRate
-   * seconds. At DFTNUM_8192 that's ~20ms/DFT in LP mode (SINC3 output rate
-   * 400kHz = ADCRATE_800KHZ/ADCSINC3OSR_2), ~41ms/point total -- capping
-   * the AD5940 itself at ~24 samples/sec, deliberately slower than the 5Hz
-   * this used to run at. DFTNUM_512 (16x fewer points) brings that down to
-   * ~1.28ms/DFT, ~3ms/point including switch-settling waits -- comfortably
-   * under UART's own ceiling below.
-   * Tradeoff: DFTNUM sets how many excitation cycles get coherently
-   * averaged per DFT, i.e. it trades noise/SNR for speed, not "resolution"
-   * in the FFT-bin sense (the excitation frequency is programmed exactly,
-   * not searched for). At 50kHz, 512 SINC3-rate samples still span ~64
-   * cycles -- plenty. At low excitation frequencies (a few kHz or below),
-   * 512 samples span only a handful of cycles (at 1kHz, roughly 1 cycle in
-   * LP mode), so expect noticeably noisier readings there than at 50kHz+;
-   * this hasn't been tuned per-frequency. */
-  cfg->DftNum = DFTNUM_512;
+  /* DftNum/DftSrc/ADCSinc2Osr/ADCSinc3Osr previously hardcoded to a fixed
+   * DFTNUM_512 (matching neither this struct's own other filter fields,
+   * which stayed at bioz_2wire.c's ADCSINC3OSR_2 default, nor whatever
+   * AppBIOZCheckFreq() -- called later, per-frequency -- actually ends up
+   * configuring the DFT hardware to). That mismatch matters because
+   * AppBIOZSeqMeasureGen() bakes a fixed-duration SEQ_WAIT() into the
+   * sequencer's measurement command list, sized from *these* fields via
+   * AD5940_ClksCalculate() (ad5940lib/ad5940.c) -- a pure open-loop timed
+   * wait, no ready-flag check found. If that wait is sized for fewer
+   * points/a smaller SINC3 OSR than the DFT hardware register actually
+   * ends up set to (by AppBIOZCheckFreq(), which runs afterward and wins),
+   * the sequencer stops the DFT (AFECTRL_DFT bFALSE) before it's actually
+   * finished integrating -- i.e. every point silently runs a shorter,
+   * noisier DFT than its own DftNum claims, not a deliberate speed/noise
+   * tradeoff. AD5940_ClksCalculate's DATATYPE_SINC3 case scales with both
+   * point count *and* SINC3 OSR, so the old mismatch (512 vs the real
+   * 1024-ish, ADCSINC3OSR_2 vs the real ADCSINC3OSR_4) undersized the wait
+   * by close to 4x, not 2x.
+   *
+   * Fix: call the exact same AD5940_GetFreqParameters(freq) that
+   * AppBIOZCheckFreq() itself calls, right here, and copy all four fields
+   * from its result -- a pure function of freq_hz alone, so this and
+   * AppBIOZCheckFreq()'s later internal call are guaranteed to agree. */
+  FreqParams_Type freq_params = AD5940_GetFreqParameters(freq_hz);
+  cfg->DftNum = freq_params.DftNum;
+  cfg->DftSrc = freq_params.DftSrc;
+  cfg->ADCSinc2Osr = (uint8_t)freq_params.ADCSinc2Osr;
+  cfg->ADCSinc3Osr = (uint8_t)freq_params.ADCSinc3Osr;
 
-  /* 200Hz: fast as the UART link can sustain, not as fast as the AD5940
-   * can run. Each printed line is ~85-90 bytes; at 230400 baud (8N1, so
-   * 23040 bytes/sec) that's ~3.7-3.9ms/line -- a real ceiling around
-   * 250-270 lines/sec regardless of measurement speed. 200Hz (5ms/sample)
-   * leaves ~25% headroom under that ceiling for line-length growth (sample
-   * numbers gain digits over a long continuous run) and normal jitter.
-   * Going faster than the UART can drain risks the AD5940's FIFO backing
-   * up between AppBIOZISR() polls, which resurfaces a real indexing bug in
-   * bioz_2wire.c's AppBIOZDataProcess() (pairs up the wrong current/voltage
-   * DFT results once more than one point's worth of data is buffered) --
-   * this rate was chosen specifically to stay clear of that, not just for
-   * raw speed. */
+  /* 200Hz: originally sized against the old ASCII UART line format's
+   * throughput ceiling (~85-90 bytes/line at 230400 baud), which no longer
+   * applies now that per-sample data goes out as a 16-byte binary frame
+   * (~1440/sec ceiling -- see SendSampleBinary()'s comment). Left at 200Hz
+   * regardless: it's the sequencer's *trigger* period (the Wakeup Timer),
+   * not a guarantee -- the real limit is how long the DFT/settling above
+   * actually take (comfortably over 5ms at any frequency this firmware
+   * targets, per the DftNum fix above), so BIOZODR asking for faster than
+   * that doesn't get you a faster rate, and whether asking for *much*
+   * faster than achievable causes its own problems (missed/overlapping
+   * triggers) hasn't been checked. Still relevant regardless of the exact
+   * value: going faster than the AD5940 can actually drain risks its FIFO
+   * backing up between AppBIOZISR() polls, which resurfaces a real
+   * indexing bug in bioz_2wire.c's AppBIOZDataProcess() (pairs up the
+   * wrong current/voltage DFT results once more than one point's worth of
+   * data is buffered). */
   cfg->BIOZODR = 200.0f;
   cfg->NumOfData = -1; /* run until 'stop' -- no sweep, no natural end */
 

@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
@@ -181,7 +182,18 @@ class SerialReader(threading.Thread):
         buf = b""
         while not self.stop_flag.is_set():
             try:
-                chunk = self.ser.read(256)
+                # Deliberately small: a large read() lets many already-
+                # buffered sample frames return in one call, which then get
+                # timestamped (see parse loop below) within microseconds of
+                # each other in a tight loop -- visible on the time-series
+                # plot as samples clustering at nearly the same x with a gap
+                # before the next cluster, not reflecting when they actually
+                # arrived. 32 bytes (2 sample frames, or a slice of a text
+                # line -- either way harmless, since partial data just
+                # accumulates in buf across calls) makes read() return
+                # closer to real time as bytes trickle in instead of
+                # batching up to 16 frames (256 bytes) per call.
+                chunk = self.ser.read(32)
             except (serial.SerialException, OSError, TypeError):
                 # Closing the port from the main thread while this call is
                 # blocked (timeout=0.2 means it can't block for long, but
@@ -211,7 +223,13 @@ class SerialReader(threading.Thread):
                     buf = buf[sync_idx + SAMPLE_FRAME_LEN:]
                     sample = parse_sample_frame(frame)
                     if sample is not None:
-                        self.out_queue.put(("sample", sample))
+                        # Timestamped here, at actual receipt, rather than
+                        # in _poll_queue (a 100ms Tk .after() tick) -- the
+                        # latter would batch several frames per tick and
+                        # give them near-identical timestamps, making the
+                        # time axis bursty instead of reflecting real
+                        # arrival spacing.
+                        self.out_queue.put(("sample", sample + (time.time(),)))
                     continue
                 if nl_idx != -1:
                     line, buf = buf[:nl_idx], buf[nl_idx + 1:]
@@ -240,8 +258,15 @@ class App(tk.Tk):
         self.sweep_phase = []
 
         self.ts_sample = deque(maxlen=TIME_SERIES_MAXLEN)
+        self.ts_time = deque(maxlen=TIME_SERIES_MAXLEN)
         self.ts_mag = deque(maxlen=TIME_SERIES_MAXLEN)
         self.ts_phase = deque(maxlen=TIME_SERIES_MAXLEN)
+        # Wall-clock time of the first sample in the current run -- set the
+        # moment ts_time goes from empty to non-empty (see _poll_queue), not
+        # when 'start' is sent, so the time axis reads 0 at the first real
+        # sample instead of including the variable AD5940 init/RTIA-cal
+        # latency before it as a misleading offset.
+        self._ts_epoch = None
 
         # Sample frames don't carry frequency (it's fixed for the whole
         # 'start <Hz>' run) -- set from freq_var whenever a run starts, used
@@ -550,8 +575,10 @@ class App(tk.Tk):
         self.sweep_mag.clear()
         self.sweep_phase.clear()
         self.ts_sample.clear()
+        self.ts_time.clear()
         self.ts_mag.clear()
         self.ts_phase.clear()
+        self._ts_epoch = None
         self._redraw()
         self.ser.write((command + "\r\n").encode())
         self.status_var.set(f"Sent '{command}'...")
@@ -566,7 +593,7 @@ class App(tk.Tk):
                 break
 
             if kind == "sample":
-                sample_num, real, imag, apply_baseline = payload
+                sample_num, real, imag, apply_baseline, recv_time = payload
                 mag = math.hypot(real, imag)
                 phase = math.degrees(math.atan2(imag, real))
                 suffix = "" if apply_baseline else " (uncalibrated -- run 'zero' first)"
@@ -578,7 +605,10 @@ class App(tk.Tk):
                 if self.plot_mode != "timeseries":
                     self.plot_mode = "timeseries"
                     self._configure_axes()
+                if self._ts_epoch is None:
+                    self._ts_epoch = recv_time
                 self.ts_sample.append(sample_num)
+                self.ts_time.append(recv_time - self._ts_epoch)
                 self.ts_mag.append(mag)
                 self.ts_phase.append(phase)
                 redraw_needed = True
@@ -607,15 +637,16 @@ class App(tk.Tk):
 
     def _configure_axes(self):
         """Switches axis scale/labels between the sweep view (|Z|/phase vs.
-        frequency, log-x) and the impedance time-series view (vs. sample #,
-        linear-x). Called whenever the format of incoming data lines
-        changes, not tied to the firmware dropdown -- see _poll_queue."""
+        frequency, log-x) and the impedance time-series view (vs. time in
+        seconds since the first sample of the run, linear-x). Called
+        whenever the format of incoming data lines changes, not tied to the
+        firmware dropdown -- see _poll_queue."""
         if self.plot_mode == "timeseries":
             self.ax_mag.set_ylabel("|Z| (ohm)")
             self.ax_phase.set_ylabel("phase (deg)")
             self.ax_mag.set_xscale("linear")
             self.ax_phase.set_xscale("linear")
-            self.ax_phase.set_xlabel("sample #")
+            self.ax_phase.set_xlabel("time (s)")
         else:
             self.ax_mag.set_ylabel("|Z| (ohm)")
             self.ax_phase.set_ylabel("phase (deg)")
@@ -625,7 +656,7 @@ class App(tk.Tk):
 
     def _redraw(self):
         if self.plot_mode == "timeseries":
-            x, mag, phase = self.ts_sample, self.ts_mag, self.ts_phase
+            x, mag, phase = self.ts_time, self.ts_mag, self.ts_phase
         else:
             x, mag, phase = self.sweep_freq, self.sweep_mag, self.sweep_phase
         self.mag_line.set_data(x, mag)
