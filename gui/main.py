@@ -11,6 +11,8 @@ The plot switches between a frequency sweep view and a vs.-sample-number
 time-series view automatically based on which line format is actually
 coming in.
 """
+import bisect
+import csv
 import math
 import os
 import queue
@@ -23,7 +25,7 @@ import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog
 
 import serial
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -59,10 +61,17 @@ DATA_LINE_RE = re.compile(
     r"\|Z\|=([\d.eE+-]+)ohm\s+phase=([-\d.eE+]+)deg"
 )
 
-# Cap how many time-series points are kept/plotted -- it streams forever
-# (no natural end, unlike a 40-point sweep), so without a cap both memory
-# and per-frame redraw cost would grow without bound on a long recording.
-TIME_SERIES_MAXLEN = 300
+# Cap how many time-series points are kept in memory for the *live plot* --
+# it streams forever (no natural end, unlike a 40-point sweep), so without a
+# cap memory would grow without bound on a long run. This is independent of
+# CSV recording (see _on_record_toggle), which streams straight to disk and
+# isn't bounded by this. 12000 covers a full 60s of scrollback at the
+# 2-wire firmware's 200Hz BIOZODR (the fastest of the two time-series
+# firmwares) -- the x-axis window control (ts_window_var) then just slices
+# into whatever of that is actually buffered, so the 4-wire firmware's much
+# slower 5Hz rate ends up with proportionally more (~40 minutes) of
+# scrollback for free.
+TIME_SERIES_MAXLEN = 12000
 
 
 def find_daplink_device():
@@ -273,6 +282,14 @@ class App(tk.Tk):
         # to reconstruct a readable log line for each incoming frame.
         self._active_freq = 0.0
 
+        # CSV recording, independent of the (bounded) live-plot buffers
+        # above -- writes straight to disk as each row arrives so a
+        # multi-hour run doesn't have to sit in Python memory waiting for an
+        # "Export" click. None/None while not recording; see
+        # _on_record_toggle.
+        self.record_file = None
+        self.record_writer = None
+
         # Which buffers/axis-scale _redraw() should use; switched
         # automatically the moment a line in the other format arrives (see
         # _poll_queue), not tied to the firmware dropdown -- that only
@@ -281,7 +298,12 @@ class App(tk.Tk):
 
         self._build_widgets()
         self._on_firmware_change()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_queue)
+
+    def _on_close(self):
+        self._stop_recording()
+        self.destroy()
 
     # ---- UI construction ----
     def _build_widgets(self):
@@ -318,6 +340,16 @@ class App(tk.Tk):
         )
         self.connect_btn.pack(side="left")
 
+        # Streams every incoming row straight to a CSV file as it arrives
+        # (see _on_record_toggle) -- independent of the bounded live-plot
+        # buffers, so it's the way to keep a run longer than
+        # TIME_SERIES_MAXLEN actually holds.
+        self.record_btn = ttk.Button(
+            top, text="Start Recording", command=self._on_record_toggle,
+            state="disabled",
+        )
+        self.record_btn.pack(side="left", padx=(12, 0))
+
         controls = ttk.Frame(self, padding=(6, 0))
         controls.pack(fill="x")
         self.zero_btn = ttk.Button(
@@ -352,6 +384,21 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(
             controls, text="Stop", command=lambda: self._send("stop"),
             state="disabled",
+        )
+
+        # Time-series-only: how much scrollback (in seconds, ending at the
+        # newest sample) _redraw() actually plots, out of whatever
+        # TIME_SERIES_MAXLEN has buffered -- lets you zoom into recent data
+        # on a long run without that run's full history being redrawn every
+        # tick. The trace redraws immediately on every keystroke/arrow-click
+        # rather than waiting for the next sample, since typing a new value
+        # otherwise wouldn't visibly do anything until one arrived.
+        self.ts_window_var = tk.StringVar(value="10")
+        self.ts_window_var.trace_add("write", lambda *_a: self._redraw())
+        self.window_label = ttk.Label(controls, text="Window (s):")
+        self.window_spin = ttk.Spinbox(
+            controls, from_=1, to=60, increment=1, width=6,
+            textvariable=self.ts_window_var,
         )
 
         self.status_var = tk.StringVar(value="Not connected.")
@@ -508,6 +555,7 @@ class App(tk.Tk):
             self.reader = None
             self.connect_btn.config(text="Connect")
             self.status_var.set("Not connected.")
+            self._stop_recording()
         self._update_control_states()
 
     # ---- firmware selection changes which controls are usable ----
@@ -522,6 +570,8 @@ class App(tk.Tk):
         self.stop_btn.pack_forget()
         self.zero_btn.pack_forget()
         self.start_btn.pack_forget()
+        self.window_label.pack_forget()
+        self.window_spin.pack_forget()
 
         if is_time_series:
             self.freq_entry.pack(side="left", padx=(0, 4))
@@ -529,6 +579,8 @@ class App(tk.Tk):
                 self.zero_ts_btn.pack(side="left", padx=(0, 4))
             self.continuous_btn.pack(side="left", padx=(0, 4))
             self.stop_btn.pack(side="left", padx=(0, 8))
+            self.window_label.pack(side="left", padx=(0, 4))
+            self.window_spin.pack(side="left", padx=(0, 8))
         else:
             self.start_btn.config(text="Start Sweep")
             self.zero_btn.pack(side="left", padx=(0, 8))
@@ -547,6 +599,43 @@ class App(tk.Tk):
         self.stop_btn.config(state=state if is_time_series else "disabled")
         self.zero_btn.config(state=state if not is_time_series else "disabled")
         self.start_btn.config(state=state if not is_time_series else "disabled")
+        self.record_btn.config(state=state)
+
+    # ---- CSV recording (independent of the bounded live-plot buffers --
+    # see TIME_SERIES_MAXLEN) ----
+    RECORD_HEADER = [
+        "kind", "sample_num", "freq_hz", "time_s",
+        "real_ohm", "imag_ohm", "mag_ohm", "phase_deg", "calibrated",
+    ]
+
+    def _on_record_toggle(self):
+        if self.record_writer is not None:
+            self._stop_recording()
+            return
+        path = filedialog.asksaveasfilename(
+            title="Record to CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.record_file = open(path, "w", newline="")
+        except OSError as e:
+            self._log(f"Could not open {path} for recording: {e}")
+            return
+        self.record_writer = csv.writer(self.record_file)
+        self.record_writer.writerow(self.RECORD_HEADER)
+        self.record_btn.config(text="Stop Recording")
+        self._log(f"Recording to {path}")
+
+    def _stop_recording(self):
+        if self.record_file is not None:
+            self.record_file.close()
+            self._log("Recording stopped.")
+        self.record_file = None
+        self.record_writer = None
+        self.record_btn.config(text="Start Recording")
 
     def _on_zero_continuous(self):
         try:
@@ -607,10 +696,17 @@ class App(tk.Tk):
                     self._configure_axes()
                 if self._ts_epoch is None:
                     self._ts_epoch = recv_time
+                ts_sec = recv_time - self._ts_epoch
                 self.ts_sample.append(sample_num)
-                self.ts_time.append(recv_time - self._ts_epoch)
+                self.ts_time.append(ts_sec)
                 self.ts_mag.append(mag)
                 self.ts_phase.append(phase)
+                if self.record_writer is not None:
+                    self.record_writer.writerow([
+                        "sample", sample_num, self._active_freq, f"{ts_sec:.6f}",
+                        real, imag, mag, phase, int(apply_baseline),
+                    ])
+                    self.record_file.flush()
                 redraw_needed = True
                 continue
 
@@ -626,6 +722,11 @@ class App(tk.Tk):
                 self.sweep_freq.append(freq)
                 self.sweep_mag.append(mag)
                 self.sweep_phase.append(phase)
+                if self.record_writer is not None:
+                    self.record_writer.writerow([
+                        "sweep", "", freq, "", _real, _imag, mag, phase, "",
+                    ])
+                    self.record_file.flush()
                 redraw_needed = True
             elif "BIOZ Stop Now" in line:
                 self.status_var.set("Sweep complete.")
@@ -654,9 +755,32 @@ class App(tk.Tk):
             self.ax_phase.set_xscale("log")
             self.ax_phase.set_xlabel("frequency (Hz)")
 
+    def _windowed_timeseries(self):
+        """Returns (time, mag, phase) trimmed to the last ts_window_var
+        seconds of self.ts_time, out of whatever TIME_SERIES_MAXLEN has
+        actually buffered. Feeding only this slice into the plot (rather
+        than the full buffer with set_xlim() applied after) means a small
+        window stays cheap to redraw even once the buffer's full, since
+        matplotlib never sees the off-screen points at all. Falls back to
+        the whole buffer if the window field doesn't parse -- typing a new
+        value goes through a transient empty/partial state on every
+        keystroke via the StringVar trace, so this has to tolerate that
+        rather than erroring."""
+        times = list(self.ts_time)
+        mags = list(self.ts_mag)
+        phases = list(self.ts_phase)
+        try:
+            window = float(self.ts_window_var.get())
+        except ValueError:
+            window = None
+        if window is not None and window > 0 and times:
+            lo = bisect.bisect_left(times, times[-1] - window)
+            times, mags, phases = times[lo:], mags[lo:], phases[lo:]
+        return times, mags, phases
+
     def _redraw(self):
         if self.plot_mode == "timeseries":
-            x, mag, phase = self.ts_time, self.ts_mag, self.ts_phase
+            x, mag, phase = self._windowed_timeseries()
         else:
             x, mag, phase = self.sweep_freq, self.sweep_mag, self.sweep_phase
         self.mag_line.set_data(x, mag)
