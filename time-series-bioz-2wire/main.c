@@ -349,23 +349,54 @@ static void TimeSeriesStructInit(float freq_hz) {
   cfg->ADCSinc2Osr = (uint8_t)freq_params.ADCSinc2Osr;
   cfg->ADCSinc3Osr = (uint8_t)freq_params.ADCSinc3Osr;
 
-  /* 200Hz: originally sized against the old ASCII UART line format's
-   * throughput ceiling (~85-90 bytes/line at 230400 baud), which no longer
-   * applies now that per-sample data goes out as a 16-byte binary frame
-   * (~1440/sec ceiling -- see SendSampleBinary()'s comment). Left at 200Hz
-   * regardless: it's the sequencer's *trigger* period (the Wakeup Timer),
-   * not a guarantee -- the real limit is how long the DFT/settling above
-   * actually take (comfortably over 5ms at any frequency this firmware
-   * targets, per the DftNum fix above), so BIOZODR asking for faster than
-   * that doesn't get you a faster rate, and whether asking for *much*
-   * faster than achievable causes its own problems (missed/overlapping
-   * triggers) hasn't been checked. Still relevant regardless of the exact
-   * value: going faster than the AD5940 can actually drain risks its FIFO
-   * backing up between AppBIOZISR() polls, which resurfaces a real
-   * indexing bug in bioz_2wire.c's AppBIOZDataProcess() (pairs up the
-   * wrong current/voltage DFT results once more than one point's worth of
-   * data is buffered). */
-  cfg->BIOZODR = 200.0f;
+  /* 5000Hz, raised from the old 200Hz. It's the sequencer's *trigger*
+   * period (the Wakeup Timer), not a guarantee -- the real limit is how
+   * long the DFT/settling above actually take, and that changed: widening
+   * AD5940_GetFreqParameters()'s DftNum search (ad5940lib/ad5940.c) means
+   * the DFT window at higher excitation frequencies is now well under
+   * 200Hz's own 5ms period (e.g. ~1.28ms at 10kHz, DftNum=256 vs the old
+   * DftNum=1024's 5.12ms) -- so the old 200Hz trigger rate had become the
+   * bottleneck, not the AD5940 itself.
+   *
+   * Measured on hardware at 10kHz: 200Hz trigger -> ~211 samples/sec (no
+   * change from the pre-widening baseline, confirming 200Hz was the
+   * bottleneck); 1000Hz -> ~260/sec; 5000Hz -> ~327/sec, zero checksum
+   * failures, zero non-monotonic sample jumps. That 327/sec is well short
+   * of the ~781/sec naive theoretical ceiling (DftNum=256's acquisition
+   * window alone) -- the gap is everything AD5940_ClksCalculate()'s window
+   * doesn't cover: this loop measures both the current and RCAL/voltage
+   * channels per sample point (two DFTs, not one -- see
+   * AppBIOZDataProcess()'s current/voltage pairing below), plus excitation
+   * settling time, sequencer command overhead, and the AppBIOZISR()/UART
+   * path. So the DFT window shrinking doesn't translate 1:1 into sample
+   * rate; widening the search is a real, verified ~55% win at 10kHz
+   * (211->327/sec), not the 4x a DFT-window-only estimate would suggest.
+   *
+   * 5000Hz was chosen, not something higher, because of a real bug hit
+   * while characterizing this: pushed to 20000Hz, the stream produced
+   * exactly one sample and then stalled for the rest of a 30s capture.
+   * Root cause, found by reading bioz_2wire.c's AppBIOZCtrl():
+   * `wupt_cfg.SeqxSleepTime[SEQID_0] = (uint32_t)(WuptClkFreq/BIOZODR)-2-1`
+   * (WuptClkFreq is 32000). At BIOZODR=20000, 32000/20000 truncates to 1,
+   * and `1u - 2 - 1` wraps around as unsigned arithmetic to ~4.29 billion
+   * 32kHz ticks (~37 hours) -- not a hardware saturation limit, a genuine
+   * integer underflow in vendored code. It triggers whenever
+   * BIOZODR > WuptClkFreq/3 (~10666Hz here); this firmware must never be
+   * configured above that regardless of frequency. 5000Hz keeps >2x margin
+   * below it. Re-verified clean at 1kHz too (BIOZODR=5000, ~48.8
+   * samples/sec, zero checksum failures, zero non-monotonic jumps) --
+   * 1kHz's own achievable rate was already well under even the old 200Hz
+   * trigger, so it was never bottlenecked by BIOZODR and is unaffected by
+   * this change, as expected (the widened search doesn't lower 1kHz's
+   * DftNum either -- 2048 was already the minimum passing >=8 cycles).
+   *
+   * Still relevant regardless of the exact value: going faster than the
+   * AD5940 can actually drain risks its FIFO backing up between
+   * AppBIOZISR() polls, which would resurface a real indexing bug in
+   * bioz_2wire.c's AppBIOZDataProcess() (pairs up the wrong current/voltage
+   * DFT results once more than one point's worth of data is buffered) --
+   * not observed at 5000Hz, but not exhaustively stress-tested either. */
+  cfg->BIOZODR = 5000.0f;
   cfg->NumOfData = -1; /* run until 'stop' -- no sweep, no natural end */
 
   /* Forces AppBIOZInit() to actually redo RTIA calibration and regenerate
@@ -514,6 +545,25 @@ int main(void) {
 
     TimeSeriesStructInit(freq_hz);
     AppBIOZInit(app_buff, sizeof(app_buff) / sizeof(app_buff[0]));
+
+    /* REVERTED (see git history for the DFTNUM_256/DFTNUM_512 override
+     * experiment this used to be). Root cause of why it broke: the AD5940's
+     * own frequency-parameter search (AD5940_GetFreqParameters(),
+     * ad5940lib/ad5940.c) enforces iCycle >= 8 -- the DFT window must span
+     * at least 8 full excitation cycles, or the frequency-domain result is
+     * invalid (spectral leakage), not just noisier. iCycle scales with
+     * DftNum * frequency, so the *safe reduction margin* below the
+     * library's own chosen DftNum shrinks as frequency drops -- confirmed
+     * on hardware: DFTNUM_512 tested fine at 10kHz (iCycle ~26, correct
+     * value there is 1024 so this was a mild 2x cut) but produced garbage
+     * at 1kHz (iCycle ~2.56 -- the *correct* DftNum at 1kHz is 2048, not
+     * 1024, so the same fixed override was actually an unrecognized 4x cut
+     * relative to what that frequency needs, and 2048's own iCycle is only
+     * ~10.2 to begin with, barely above the minimum -- almost no headroom
+     * existed there at all). A fixed override value doesn't generalize
+     * across frequencies; a real speedup here needs to scale the reduction
+     * against each frequency's own iCycle headroom, not assume one number
+     * works everywhere. */
     AppBIOZCtrl(BIOZCTRL_START, 0);
 
     float freq_reported;

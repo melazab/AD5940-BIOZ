@@ -817,8 +817,29 @@ FreqParams_Type AD5940_GetFreqParameters(float freq)
 		if(((AdcRate/n1) < freq * 10) && (freq<20e3))
 			continue;
 		
-		/* Try DFT number */
-		for(uint32_t j = 8; j<sizeof(dft_table) / sizeof(uint32_t); j++)
+		/* Try DFT number. Search starts at j=0 (DftNum=4), not ADI's original
+		 * j=8 (DftNum=1024) -- that 1024 floor was just this table search's
+		 * hardcoded starting point, unrelated to the iCycle>=8 check just
+		 * below, which is the real quality/coherency floor (>=8 full
+		 * excitation cycles inside the DFT window; the AD5940 datasheet's
+		 * WGFCW description, pg. 102, only requires fOUT/(DFT input rate/N)
+		 * to be an integer -- no minimum cycle count is mandated by the
+		 * silicon itself). At higher excitation frequencies the same
+		 * iCycle>=8 floor is reached at a far smaller DftNum than 1024 (e.g.
+		 * ~256 at 10kHz), so the old hardcoded start needlessly forced a
+		 * longer, slower DFT window than the quality floor actually
+		 * required. This doesn't touch the iCycle<8 check itself -- it only
+		 * lets higher-frequency excitations reach a passing DftNum sooner.
+		 * Confirmed this is the only place that needs to change:
+		 * AppBIOZCheckFreq() (bioz_2wire.c) -- which re-syncs both the live
+		 * DFT/ADC filter registers and the sequencer's baked
+		 * SEQ_WAIT(WaitClks) every time AppBIOZInit() runs -- calls this
+		 * same function, so both stay in sync automatically. Duplicating
+		 * this search elsewhere (e.g. in main.c) instead of widening it here
+		 * would NOT reach AppBIOZCheckFreq()'s call and would reintroduce
+		 * the exact WaitClks/DftNum mismatch bug fixed previously (see
+		 * TimeSeriesStructInit()'s comment in time-series-bioz-2wire/main.c). */
+		for(uint32_t j = 0; j<sizeof(dft_table) / sizeof(uint32_t); j++)
 		{
 			n2 = dft_table[j];
 			iCycle = (uint32_t)(n1 * n2 * freq)/AdcRate;
