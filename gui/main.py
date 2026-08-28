@@ -197,12 +197,13 @@ class SerialReader(threading.Thread):
                 # each other in a tight loop -- visible on the time-series
                 # plot as samples clustering at nearly the same x with a gap
                 # before the next cluster, not reflecting when they actually
-                # arrived. 32 bytes (2 sample frames, or a slice of a text
-                # line -- either way harmless, since partial data just
-                # accumulates in buf across calls) makes read() return
-                # closer to real time as bytes trickle in instead of
-                # batching up to 16 frames (256 bytes) per call.
-                chunk = self.ser.read(32)
+                # arrived. 16 bytes = exactly one sample frame (confirmed
+                # this mattered in practice: an earlier 32-byte version --
+                # exactly *two* frames -- still paired up every sample with
+                # its neighbor at an identical timestamp in real recorded
+                # data). A partial text line is harmless too; partial data
+                # just accumulates in buf across calls either way.
+                chunk = self.ser.read(16)
             except (serial.SerialException, OSError, TypeError):
                 # Closing the port from the main thread while this call is
                 # blocked (timeout=0.2 means it can't block for long, but
