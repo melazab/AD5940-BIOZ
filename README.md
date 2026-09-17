@@ -179,6 +179,19 @@ printing. Each firmware's specific controls (plain `start`/`zero` for the
 sweep firmwares, `start <Hz>`/`stop`/`zero <Hz>` for the time-series ones)
 are shown/hidden based on the firmware selected.
 
+With multiple evaluation boards connected, choose a board in **Flash target**
+(device path/drive letter and unique USB serial), choose the firmware, then
+click **Build && Flash**. Select the other board and repeat to flash it next.
+The dropdown rescans when opened; **Refresh targets** also rescans after plugging
+or unplugging boards. When multiple boards are detected, you must select one.
+The GUI checks the selected board's identity before writing and passes its
+serial number to OpenOCD so the same board is reset. A disconnected board
+causes the operation to stop instead of switching to another board.
+
+**Serial port** independently selects the UART connection used for measurement;
+it does not select the flash target. Disconnect before choosing another UART
+port and connecting to it.
+
 ## `docs/`
 
 Reference material, not something to build: the EVAL-AD5940 user guide,

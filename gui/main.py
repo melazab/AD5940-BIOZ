@@ -13,6 +13,7 @@ coming in.
 """
 import bisect
 import csv
+import json
 import math
 import os
 import queue
@@ -24,6 +25,7 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import ttk, scrolledtext, filedialog
 
@@ -74,52 +76,74 @@ DATA_LINE_RE = re.compile(
 TIME_SERIES_MAXLEN = 12000
 
 
-def find_daplink_device():
-    """Returns the DAPLink block device name (e.g. 'sda'), or None. Linux only
-    -- see find_daplink_mount_windows for the Windows equivalent."""
-    out = subprocess.run(
-        ["lsblk", "-o", "NAME,LABEL", "-nr"], capture_output=True, text=True
-    ).stdout
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) == 2 and parts[1].strip() == "DAPLINK":
-            return parts[0].strip()
-    return None
+@dataclass(frozen=True)
+class FlashTarget:
+    device: str
+    serial: str
+    mount: str = ""
+
+    @property
+    def label(self):
+        return f"{self.device} — {self.serial or 'unknown serial'}"
 
 
-def find_mountpoint(device):
-    out = subprocess.run(
-        ["lsblk", "-o", "NAME,MOUNTPOINT", "-nr"], capture_output=True, text=True
-    ).stdout
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if parts and parts[0].strip() == device and len(parts) == 2:
-            return parts[1].strip()
-    return None
+def read_daplink_serial(mount):
+    """DAPLink exposes its USB unique ID in DETAILS.TXT."""
+    try:
+        details = (Path(mount) / "DETAILS.TXT").read_text(errors="replace")
+    except OSError:
+        return ""
+    match = re.search(r"^Unique ID:\s*([0-9a-fA-F]+)\s*$", details, re.MULTILINE)
+    return match.group(1) if match else ""
 
 
-def find_daplink_mount_windows():
-    """Returns the DAPLink drive root (e.g. 'D:\\\\'), or None. DAPLink shows
-    up as a normal removable drive on Windows -- no lsblk/udisksctl
-    equivalent exists, so this scans drive letters for the volume label
-    instead (stdlib ctypes only, no extra dependency)."""
-    import ctypes
+def list_flash_targets():
+    """Enumerate every DAPLink volume, retaining its probe identity."""
+    if sys.platform == "win32":
+        import ctypes
 
-    kernel32 = ctypes.windll.kernel32
-    bitmask = kernel32.GetLogicalDrives()
-    for i in range(26):
-        if not (bitmask & (1 << i)):
-            continue
-        drive = f"{chr(65 + i)}:\\"
-        name_buf = ctypes.create_unicode_buffer(261)
-        # Non-zero return means the call succeeded; GetVolumeInformationW
-        # can fail/hang-free-return-False for e.g. an empty CD drive.
-        ok = kernel32.GetVolumeInformationW(
-            drive, name_buf, len(name_buf), None, None, None, None, 0
-        )
-        if ok and name_buf.value == "DAPLINK":
-            return drive
-    return None
+        targets = []
+        kernel32 = ctypes.windll.kernel32
+        bitmask = kernel32.GetLogicalDrives()
+        for i in range(26):
+            if not (bitmask & (1 << i)):
+                continue
+            drive = f"{chr(65 + i)}:\\"
+            name_buf = ctypes.create_unicode_buffer(261)
+            ok = kernel32.GetVolumeInformationW(
+                drive, name_buf, len(name_buf), None, None, None, None, 0
+            )
+            if ok and name_buf.value == "DAPLINK":
+                targets.append(FlashTarget(drive, read_daplink_serial(drive), drive))
+        return targets
+
+    proc = subprocess.run(
+        ["lsblk", "--json", "--paths", "-o", "NAME,LABEL,SERIAL,MOUNTPOINT"],
+        capture_output=True, text=True, check=True,
+    )
+    targets = []
+
+    def visit(devices, parent_serial=""):
+        for device in devices:
+            serial_number = (device.get("serial") or parent_serial).strip()
+            if device.get("label") == "DAPLINK":
+                targets.append(FlashTarget(
+                    device["name"], serial_number, device.get("mountpoint") or ""
+                ))
+            visit(device.get("children", []), serial_number)
+
+    visit(json.loads(proc.stdout)["blockdevices"])
+    return sorted(targets, key=lambda target: target.device)
+
+
+def resolve_flash_target(selected):
+    """Re-resolve by serial so a reused device path cannot select another board."""
+    if not re.fullmatch(r"[0-9a-fA-F]+", selected.serial):
+        raise ValueError("Selected board has no valid unique ID; cannot safely flash/reset it.")
+    matches = [t for t in list_flash_targets() if t.serial == selected.serial]
+    if len(matches) != 1:
+        raise ValueError("Selected board is disconnected or its unique ID is ambiguous. Refresh targets.")
+    return matches[0]
 
 
 def list_serial_ports():
@@ -298,6 +322,7 @@ class App(tk.Tk):
         self.plot_mode = "sweep"
 
         self._build_widgets()
+        self._refresh_flash_targets()
         self._on_firmware_change()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_queue)
@@ -350,6 +375,21 @@ class App(tk.Tk):
             state="disabled",
         )
         self.record_btn.pack(side="left", padx=(12, 0))
+
+        flash_row = ttk.Frame(self, padding=(6, 0, 6, 6))
+        flash_row.pack(fill="x")
+        ttk.Label(flash_row, text="Flash target:").pack(side="left")
+        self.flash_target_var = tk.StringVar()
+        self.flash_targets = {}
+        self.flash_target_combo = ttk.Combobox(
+            flash_row, textvariable=self.flash_target_var, state="readonly",
+            width=64, postcommand=self._refresh_flash_targets,
+        )
+        self.flash_target_combo.pack(side="left", padx=(4, 8))
+        self.refresh_targets_btn = ttk.Button(
+            flash_row, text="Refresh targets", command=self._refresh_flash_targets
+        )
+        self.refresh_targets_btn.pack(side="left")
 
         controls = ttk.Frame(self, padding=(6, 0))
         controls.pack(fill="x")
@@ -441,18 +481,52 @@ class App(tk.Tk):
         self.log.see("end")
 
     # ---- build & flash ----
-    def _on_build_flash(self):
-        self.build_btn.config(state="disabled")
-        threading.Thread(target=self._build_flash_worker, daemon=True).start()
-
-    def _build_flash_worker(self):
+    def _refresh_flash_targets(self):
+        previous = self.flash_targets.get(self.flash_target_var.get())
         try:
-            self._build_flash_worker_inner()
-        finally:
-            self.after(0, lambda: self.build_btn.config(state="normal"))
+            targets = list_flash_targets()
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            self._log(f"Could not enumerate DAPLink boards: {exc}")
+            targets = []
+        self.flash_targets = {target.label: target for target in targets}
+        self.flash_target_combo["values"] = list(self.flash_targets)
+        retained = next((t for t in targets if previous and t.serial == previous.serial), None)
+        if retained:
+            self.flash_target_var.set(retained.label)
+        elif previous is None and len(targets) == 1:
+            self.flash_target_var.set(targets[0].label)
+        else:
+            self.flash_target_var.set("")
 
-    def _build_flash_worker_inner(self):
+    def _on_build_flash(self):
+        selected = self.flash_targets.get(self.flash_target_var.get())
+        if selected is None:
+            self._log("Select a DAPLink board in Flash target first (use Refresh targets if needed).")
+            return
+        # Capture Tk values on the UI thread; this job keeps its own target
+        # even if other selections change while make is running.
         name = self.firmware_var.get()
+        self.build_btn.config(state="disabled")
+        self.flash_target_combo.config(state="disabled")
+        self.refresh_targets_btn.config(state="disabled")
+        threading.Thread(target=self._build_flash_worker, args=(name, selected), daemon=True).start()
+
+    def _finish_build_flash(self):
+        self.build_btn.config(state="normal")
+        self.flash_target_combo.config(state="readonly")
+        self.refresh_targets_btn.config(state="normal")
+
+    def _build_flash_worker(self, name, selected):
+        try:
+            self._build_flash_worker_inner(name, selected)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            self._log(f"Build/flash failed: {exc}")
+        finally:
+            self.after(0, self._finish_build_flash)
+
+    def _build_flash_worker_inner(self, name, selected):
+        selected = resolve_flash_target(selected)
+        self._log(f"Flash target: {selected.label}")
         project_dir = PROJECT_ROOT / name
         target = name.replace("-", "_")
         self._log(f"=== make ({name}) ===")
@@ -464,29 +538,22 @@ class App(tk.Tk):
             self._log("Build failed, not flashing.")
             return
 
-        if sys.platform == "win32":
-            mount = find_daplink_mount_windows()
-            if not mount:
-                self._log("DAPLink drive (volume label DAPLINK) not found.")
-                return
-        else:
-            device = find_daplink_device()
-            if device is None:
-                self._log("DAPLink device (label DAPLINK) not found via lsblk.")
-                return
-            mount = find_mountpoint(device)
-            if not mount:
-                self._log(f"Mounting /dev/{device} ...")
-                r = subprocess.run(
-                    ["udisksctl", "mount", "-b", f"/dev/{device}"],
-                    capture_output=True, text=True,
-                )
-                self._log(r.stdout + r.stderr)
-                mount = find_mountpoint(device)
-            if not mount:
-                self._log("Could not determine DAPLink mount point.")
-                return
-            mount = mount + "/"
+        selected = resolve_flash_target(selected)
+        if not selected.mount and sys.platform != "win32":
+            self._log(f"Mounting {selected.device} ...")
+            r = subprocess.run(
+                ["udisksctl", "mount", "-b", selected.device],
+                capture_output=True, text=True, check=True,
+            )
+            self._log(r.stdout + r.stderr)
+            selected = resolve_flash_target(selected)
+        mount = selected.mount
+        if not mount:
+            raise ValueError("Could not determine the selected board's DAPLink mount point.")
+        # Confirm the mounted filesystem belongs to the chosen probe before
+        # writing, including when USB device paths changed during the build.
+        if read_daplink_serial(mount) != selected.serial:
+            raise ValueError("Mounted DAPLink unique ID does not match the selected board.")
 
         bin_path = project_dir / f"{target}.bin"
         dest_path = Path(mount) / bin_path.name
@@ -511,11 +578,15 @@ class App(tk.Tk):
             # "resume" included, the target came up unresponsive (no UART
             # output at all) after a flash; dropping it fixed that.
             proc = subprocess.run(
-                ["openocd", "-f", "openocd/aducm3029.cfg", "-c", "init",
+                ["openocd", "-f", "openocd/aducm3029.cfg",
+                 "-c", f"adapter serial {selected.serial}", "-c", "init",
                  "-c", "reset run", "-c", "shutdown"],
                 cwd=project_dir, capture_output=True, text=True,
             )
             self._log(proc.stdout + proc.stderr)
+            if proc.returncode != 0:
+                self._log("Firmware copied, but reset failed. Press reset on the selected board.")
+                return
         except FileNotFoundError:
             self._log(
                 "openocd not found on PATH -- flash was written, but the "
@@ -524,7 +595,7 @@ class App(tk.Tk):
                 "flash); power-cycle or press the board's reset button if "
                 "it doesn't come up running the new image."
             )
-        self._log("=== Flash complete ===")
+        self._log(f"=== Flash complete: {selected.label} ===")
 
     # ---- serial port dropdown ----
     def _refresh_ports(self):
