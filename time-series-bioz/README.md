@@ -8,7 +8,7 @@ stream one impedance sample every 200ms indefinitely at that frequency;
 `stop` ends the run and returns to the prompt so a new frequency can be
 picked. This is a time-series recorder, not a sweep -- see
 `../time-series-bioz-2wire/` for the 2-wire sibling (CE0/AIN1 only, at a
-faster 200Hz, with its own `zero <Hz>` baseline calibration that this
+a frequency-dependent sample rate, with its own `zero <Hz>` baseline calibration that this
 4-wire version doesn't need).
 
 ## Design
@@ -82,7 +82,8 @@ DFT/timing calculations).
 Unlike `blink-led` (`-nodefaultlibs`, no libc at all), this program links
 newlib (`-specs=nosys.specs`, no `-nodefaultlibs`) because the AD5940
 library needs `sqrt`/`pow`/`log10`/`atan2` and this program's output needs
-floating-point `printf`. newlib's `%f`/`%e`/`%g` conversion (`dtoa`)
+floating-point `printf` for status messages. Continuous samples use binary
+frames to avoid repeated float-formatting allocations during acquisition. newlib's `%f`/`%e`/`%g` conversion (`dtoa`)
 mallocs small, short-lived scratch buffers internally, so `startup.c`
 implements `_sbrk()` against a small fixed heap region carved out in
 `linker.ld` (`HEAP_SIZE`, 4KB, sitting between `.bss` and the stack).
@@ -127,24 +128,21 @@ not executing until you either hit reset or replug the USB cable.
 
 ## Read the output
 
-The DAPLink virtual COM port carries UART0 at **230400 baud, 8N1**:
+The DAPLink virtual COM port carries UART0 at **230400 baud, 8N1**.
+Use the [GUI quick start](../README.md#quick-start) to decode and plot samples
+or record them to CSV. Select `time-series-bioz` to expose its controls.
 
-```
-picocom -b 230400 /dev/ttyACM0
-```
+For your own serial client, send `start 50000` followed by a newline to
+begin measurement at 50 kHz. The firmware sends **16-byte binary sample
+frames**, interspersed with plain-text startup/status messages. See the
+[shared UART protocol](../README.md#uart-protocol-reference) for the frame
+layout and reference decoder. A terminal such as picocom can send commands
+and display status text, but will not display readable measurement lines.
 
-(adjust the device node to match your system; `screen /dev/ttyACM0
-230400` works too). Expect a build banner, then a prompt for `start <Hz>`,
-then one line per sample once running:
-
-```
-start 50000
-sample=0 freq=50000.0Hz Z=(482.31,-118.02)ohm |Z|=496.68ohm phase=-13.75deg
-sample=1 freq=50000.0Hz Z=(481.90,-117.88)ohm |Z|=496.20ohm phase=-13.74deg
-...
-```
-
-Type `stop` to end the run and pick a new frequency.
+Send `stop` to end the run and pick a new frequency. Sample numbers restart
+at zero on each new run. This firmware has no `zero` command; its frame's
+baseline flag is always 1. The GUI plots elapsed host reception time and
+reconstructs readable sample lines from the binary data.
 
 ## Layout
 
@@ -156,7 +154,7 @@ Type `stop` to end the run and pick a new frequency.
 - `registers.h` -- hand-written ADuCM3029 register definitions (GPIO,
   watchdog, clock, SPI0, UART0, plus the Cortex-M3 core's SysTick).
 - `main.c` -- MCU clock/UART bring-up, AD5940 platform config, the
-  `start <Hz>`/`stop` command loop, and per-sample printing.
+  `start <Hz>`/`stop` command loop, and binary sample output.
 - `startup.c` -- vector table, reset handler, and the `_sbrk`/`_write`
   newlib retargeting.
 - `linker.ld` -- flash/SRAM memory map, including the same

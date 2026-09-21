@@ -32,13 +32,17 @@ own install; a `PATH` fix on one side does nothing on the other.
 
 ### Linux
 
+On Debian/Ubuntu:
+
 ```bash
-sudo apt update && sudo apt install gcc-arm-none-eabi openocd
+sudo apt update
+sudo apt install gcc-arm-none-eabi libnewlib-arm-none-eabi make openocd python3 python3-venv python3-tk udisks2 util-linux
 ```
 
-`apt` puts both on `PATH` automatically. Verify with `arm-none-eabi-gcc --version`
-and `openocd --version`. `make`/`cp`/`sync` are already there on any normal
-Linux install.
+`apt` puts the command-line tools on `PATH` automatically. Verify with `arm-none-eabi-gcc --version`
+and `openocd --version`. Also check `make --version`. The GUI uses
+`lsblk` (util-linux) to find boards and `udisksctl` (udisks2) to mount them
+when needed; command-line `make flash` uses `cp` and `sync`.
 
 ### Windows
 
@@ -63,7 +67,11 @@ patches the current session's `PATH` so it works without reopening the
 terminal. Any *other* already-open terminal/GUI still needs a restart to
 see the change.
 
-`make` (and `cp`) come from whatever MinGW/MSYS/Git-Bash environment is already on `PATH` -- there's no separate install step for those here.
+Install GNU Make and ensure `make --version` works in the shell used to
+launch the GUI. An MSYS2 environment can provide Make and the shell tools
+used by the Makefiles (`cp`, `sync`, and `rm`); do not assume Git Bash
+alone includes Make. Install Python 3 with Tcl/Tk support as well, and
+verify `python --version` and `python -m tkinter`.
 
 OpenOCD isn't packaged via winget's default `msstore`/`winget` sources under a
 simple name, but the [xPack OpenOCD](https://github.com/xpack-dev-tools/openocd-xpack)
@@ -76,20 +84,62 @@ winget install --id xpack-dev-tools.openocd-xpack
 winget adds it to `PATH` itself, but (same as the toolchain above) only
 already-open shells/GUIs won't see it until restarted.
 
-### Why OpenOCD, on either OS
+### Reset after flashing
 
-`gui/main.py` shells out to `openocd` after every flash to reset-and-run the
-target over SWD. This isn't optional for the GUI: DAPLink's plain
-drag-and-drop MSD write does **not** reliably reset-and-run the new image on
-this board (see `blink-led/README.md`'s Flash section) -- without OpenOCD,
-the old firmware keeps running until you manually press the board's reset
-button or replug the USB cable. It's genuinely optional only if you're
-driving `make`/`make flash` by hand and are fine pressing reset yourself.
+The GUI copies the binary using Python and flushes it with `fsync` on both
+Linux and Windows, then invokes OpenOCD to reset and run the selected board.
+Install OpenOCD for this automatic reset. If it is missing or reset fails,
+press the selected board's reset button after the copy completes. DAPLink's
+mass-storage write does not reliably start the new image by itself.
 
-Unlike Linux, Windows has no `lsblk`/`udisksctl` equivalent, so `gui/main.py`
-finds the DAPLink drive by scanning drive letters for the `DAPLINK` volume
-label instead, and copies+`fsync`s the `.bin` directly in Python rather than
-shelling out to `cp`/`sync` (neither of which reliably exist on Windows).
+Command-line `make flash` only copies and syncs the binary; reset the board
+manually afterward. See [blink-led's flashing notes](blink-led/README.md#flash).
+The GUI discovers DAPLink volumes using `lsblk` on Linux and by scanning
+Windows drive letters for the `DAPLINK` volume label.
+
+## Quick start
+
+From the repository root, after installing the tools above:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r gui/requirements.txt
+python -m tkinter
+python gui/main.py
+```
+
+The Tkinter check opens a small test window; close it before launching the
+GUI. On Windows PowerShell, use `python -m venv .venv` and replace the
+activation command with `.\.venv\Scripts\Activate.ps1`. You can also run
+`.\.venv\Scripts\python.exe` directly for the remaining commands if shell
+policy prevents activation.
+
+1. Attach the shield and the appropriate 2-wire or 4-wire test connection,
+   then connect the ADICUP3029's DAPLink USB port to the computer.
+2. Select a firmware and its **Flash target**, then click **Build && Flash**.
+   Wait for the copy and reset to finish.
+3. Select that board's **Serial port** and click **Connect**. Keep the firmware
+   dropdown matched to the installed image so the correct controls appear.
+4. For a 2-wire measurement, connect a known short and capture **Zero** first
+   (set the frequency for time-series firmware). Wait for calibration to
+   finish, then replace the short with the device under test. The 4-wire
+   sweep's zero is an optional offset check; 4-wire time-series has no zero.
+5. Start a sweep or click **Start Continuous** at the chosen frequency.
+   **Stop** ends a continuous run. Use **Start Recording** before starting
+   the measurement to save its samples to CSV.
+
+For a compiler/flashing sanity check, build `blink-led` from the command
+line; it is not included in the GUI firmware dropdown:
+
+```bash
+make -C blink-led
+make -C blink-led flash DAPLINK_MOUNT=/media/your-user/DAPLINK
+```
+
+Replace the mount path with your board's actual path and press reset after
+flashing. Each firmware directory has its own Makefile; there is no root
+Makefile.
 
 ## Firmware directories
 
@@ -99,14 +149,37 @@ shelling out to `cp`/`sync` (neither of which reliably exist on Windows).
 | `measure-2wire-bioz/` | One 2-wire (CE0/AIN1) frequency sweep per `start`; `zero` first captures a baseline (RLIMIT/isolation-cap offset) to subtract per sweep point. |
 | `measure-4wire-bioz/` | One true 4-wire/Kelvin (F+/S+/F-/S-, separate excitation and sense electrode pairs) frequency sweep per `start`. |
 | `time-series-bioz/` | Continuous single-frequency 4-wire measurement -- `start <Hz>` streams one impedance sample every 200ms indefinitely; `stop` ends the run. |
-| `time-series-bioz-2wire/` | Same as above but 2-wire (CE0/AIN1), at 200Hz. `zero <Hz>` captures a baseline at a given frequency to subtract from a later `start <Hz>` at that same frequency. |
+| `time-series-bioz-2wire/` | Continuous 2-wire (CE0/AIN1) measurement; throughput depends on excitation frequency (see defaults below). `zero <Hz>` captures a baseline at a given frequency to subtract from a later `start <Hz>` at that same frequency. |
 
 All of them talk over UART0 at **230400 baud, 8N1** and use the same
-DAPLink mass-storage flashing convention (`make flash`, or the GUI's
-"Build && Flash" button) -- see `blink-led/README.md` for the flashing
+DAPLink mass-storage flashing convention (`make flash`, or, for the four
+measurement firmwares, the GUI's "Build && Flash" button) -- see `blink-led/README.md` for the flashing
 quirks (reset-after-flash, etc.) that apply everywhere. What actually comes
 over that UART differs by firmware -- see below if you're writing your own
 tool against it instead of using `gui/`.
+
+### Measurement defaults
+
+| Firmware | Excitation frequency | Configured trigger rate | Configuration |
+|---|---|---|---|
+| `measure-2wire-bioz` | 40 linearly spaced points, 1–200 kHz | 5 Hz | [`BIOZStructInit()`](measure-2wire-bioz/main.c) |
+| `measure-4wire-bioz` | 40 linearly spaced points, 1–200 kHz | 5 Hz | [`BIAStructInit()`](measure-4wire-bioz/main.c) |
+| `time-series-bioz` | Set by `start <Hz>` | 5 Hz (nominally 200 ms/sample) | [`TimeSeriesStructInit()`](time-series-bioz/main.c) |
+| `time-series-bioz-2wire` | Set by `start <Hz>` | 5,000 Hz; actual output is slower | [`TimeSeriesStructInit()`](time-series-bioz-2wire/main.c) |
+
+Trigger rate is not a guarantee of sample throughput. The 2-wire time-series
+source records approximately 327 samples/s at 10 kHz excitation and 48.8
+samples/s at 1 kHz, with frequency-dependent DFT/filter settings. These are
+previous hardware observations, not a specification for every setup. See
+[its sampling notes](time-series-bioz-2wire/README.md#sample-rate-and-dft-settings).
+
+Zero baselines are stored in MCU RAM and are lost on board reset or power
+loss. Sweeps retain one baseline per sweep point. The 2-wire time-series
+firmware retains only one baseline: another `zero <Hz>` replaces it, and it
+is applied only when `start <Hz>` uses the same parsed frequency. For
+example, `50000` and `50000.0` match; `50001` does not. Stopping a run does
+not clear the baseline. This offset subtraction is separate from the
+firmware's internal RTIA calibration.
 
 ## UART protocol reference
 
@@ -173,10 +246,11 @@ A Tkinter app (`python3 gui/main.py`, needs `pyserial`/`matplotlib` --
 `pip install -r gui/requirements.txt`) that builds and flashes whichever
 firmware directory you pick from a dropdown, connects over UART, and
 live-plots whatever comes back -- a frequency-sweep view (|Z|/phase vs.
-frequency, log-x) or a time-series view (vs. sample number), switching
-automatically based on which line format the firmware is actually
-printing. Each firmware's specific controls (plain `start`/`zero` for the
-sweep firmwares, `start <Hz>`/`stop`/`zero <Hz>` for the time-series ones)
+frequency, log-x) or a time-series view (elapsed seconds since the first
+sample), switching automatically based on received sweep lines or binary
+sample frames. Time-series timestamps are taken by the host when frames
+are decoded; they are not device acquisition timestamps. Each firmware's
+specific controls (plain `start`/`zero` for the sweep firmwares, `start <Hz>`/`stop`/`zero <Hz>` for the time-series ones)
 are shown/hidden based on the firmware selected.
 
 With multiple evaluation boards connected, choose a board in **Flash target**
@@ -192,6 +266,26 @@ causes the operation to stop instead of switching to another board.
 it does not select the flash target. Disconnect before choosing another UART
 port and connecting to it.
 
+### Plot history and CSV recording
+
+**Window (s)** selects how much recent time-series data to display (10 seconds
+by default). The plot retains at most 12,000 samples, so available history
+depends on the actual sample rate; a larger window cannot restore samples
+that have left that buffer.
+
+After connecting, click **Start Recording**, choose a CSV path, and start the
+measurement. Recording saves incoming measurement rows from that moment;
+it does not export earlier plot history. Click **Stop Recording** to close
+the file. The file is independent of the plot's history limit, and recording
+can span multiple runs. **Stop** stops acquisition but does not itself stop
+recording.
+
+CSV columns are `kind`, `sample_num`, `freq_hz`, `time_s`, `real_ohm`,
+`imag_ohm`, `mag_ohm`, `phase_deg`, and `calibrated`. Time-series rows use
+`kind=sample`; `sample_num` and `time_s` restart for each new run. `calibrated`
+is the frame's baseline flag (always 1 for 4-wire time-series). Sweep rows
+use `kind=sweep` and leave `sample_num`, `time_s`, and `calibrated` blank.
+
 ## `docs/`
 
 Reference material, not something to build: the EVAL-AD5940 user guide,
@@ -200,10 +294,3 @@ shield's own schematic (`Schematic_EVAL-AD5940BIOZ.pdf`) -- useful for
 tracing connector pinouts (e.g. which physical cable lead maps to which
 chip pin) or understanding the on-board RLIMIT/isolation-cap network that
 sits between the cable and the AD5940 in 2-wire mode.
-
-## Documentation status
-
-Every firmware directory has its own accurate `README.md` (the
-`measure-2wire-bioz/`, `measure-4wire-bioz/`, and `time-series-bioz/`
-copies that used to be stale duplicates of a since-removed sibling
-directory's original text have been rewritten).

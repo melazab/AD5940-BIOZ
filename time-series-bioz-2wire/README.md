@@ -3,58 +3,50 @@
 Continuous, single-frequency impedance measurement on the **AD5940-BIOZ**
 shield (on an **EVAL-ADICUP3029** board), read against ADI's **impedance
 test board** or a real 2-electrode sensor plugged into the shield's 2-wire
-(CE0/AIN1) header. Type `start <Hz>` over UART to stream one impedance
-sample every 5ms (200Hz) indefinitely at that frequency; `stop` ends the run
-and returns to the prompt so a new frequency can be picked. `zero <Hz>`
+(CE0/AIN1) header. Type `start <Hz>` over UART to stream impedance
+samples continuously at that frequency. Throughput depends on frequency.
+`stop` ends the run and returns to the prompt so a new frequency can be picked. `zero <Hz>`
 captures an offset baseline first (see "Zero calibration" below). This is
 the 2-wire sibling of `../time-series-bioz/` (which does the same thing
 over the 4-wire F+/S+/F-/S- header, at its own slower 5Hz rate) -- same
 UART protocol, same GUI controls, just CE0/AIN1 excitation+sense instead of
 a true 4-point Kelvin connection.
 
-## Sample rate: 200Hz, not faster
+## Sample rate and DFT settings
 
-200Hz (`cfg->BIOZODR` in `TimeSeriesStructInit()`) is deliberately tuned to
-the UART link, not the AD5940. Each printed line is ~85-90 bytes; at
-230400 baud (8N1 = 23040 bytes/sec) that's ~3.7-3.9ms/line, a hard ceiling
-around 250-270 lines/sec no matter how fast the AD5940 itself measures.
-200Hz leaves ~25% headroom under that for line-length growth (the sample
-counter gains digits over a long run) and normal jitter. Pushing `BIOZODR`
-past what the UART can drain risks the AD5940's FIFO backing up between
-`AppBIOZISR()` polls -- which resurfaces a real bug in `bioz_2wire.c`'s
-`AppBIOZDataProcess()` (it indexes DFT result pairs as `pSrcData[i]`/
-`pSrcData[i+1]` instead of `pSrcData[2*i]`/`pSrcData[2*i+1]`, so once more
-than one point's worth of data is buffered, later points in that batch get
-the wrong current paired with the wrong voltage).
+`TimeSeriesStructInit()` sets `cfg->BIOZODR = 5000.0f`. This is the
+sequencer trigger rate; it does not mean 5,000 complete impedance samples
+per second. Each sample requires current and voltage DFT captures, and
+actual throughput depends on excitation frequency and processing time.
+Source comments record approximately 327 samples/s at 10 kHz excitation and
+48.8 samples/s at 1 kHz, with no checksum failures or non-monotonic sample
+numbers in those checks. These are previous observations, not guaranteed
+rates or a fresh validation of every configuration.
 
-Getting here also required shrinking `cfg->DftNum` from `bioz_2wire.c`'s
-default `DFTNUM_8192` to `DFTNUM_512` -- each measurement point runs two
-sequential DFTs (current, then voltage), and at 8192 points each took
-~20ms in LP mode, capping the AD5940 itself around 24 samples/sec (slower
-than even the original 5Hz target, with margin to spare). `DFTNUM_512` is
-a real quality tradeoff, not a free speedup: it controls how many
-excitation cycles get coherently averaged per DFT, so fewer points means
-more per-sample noise, not "worse resolution" in the FFT sense (the
-excitation frequency is programmed exactly, not searched for). At 50kHz,
-512 points still span ~64 cycles -- fine. At low excitation frequencies (a
-few kHz or below), 512 points span only a handful of cycles (~1 cycle at
-1kHz in LP mode), so expect visibly noisier readings there than at 50kHz+;
-this hasn't been tuned per-frequency, and a true 1kHz *reporting* rate
-isn't achievable at all at 230400 baud regardless of `DftNum` -- the UART
-line format itself would need to shrink drastically or the baud rate would
-need to go up an order of magnitude, neither of which this firmware does.
+DFT length, source, and SINC filter settings come from
+`AD5940_GetFreqParameters(freq_hz)`. The sequencer wait and the DFT hardware
+therefore use matching settings. The previous fixed `DFTNUM_512` setup
+could end integration too early when the application layer later selected
+different settings.
+
+Samples use 16-byte binary frames at 230400 baud, 8N1. The raw UART capacity
+is 23,040 bytes/s, or at most 1,440 frames/s before status messages and other
+overhead; the old ASCII-line bandwidth calculation no longer applies.
+See the [shared UART protocol](../README.md#uart-protocol-reference).
+
+Do not increase `BIOZODR` blindly. The source documents wake-up timer
+arithmetic underflow above roughly 10,666 Hz with its 32 kHz clock, and the
+vendored `AppBIOZDataProcess()` still indexes overlapping current/voltage
+pairs when processing multiple samples in a batch. Clean frame checksums
+alone do not establish impedance accuracy.
 
 ## Hardware validation status
 
-Confirmed working at 50kHz: a 20kOhm resistor across the 2-wire header
-reads ~22kOhm uncalibrated, which lines up with the ~2kOhm fixed on-board
-RLIMIT/coupling network (see "Zero calibration" below) sitting in series
-with the resistor -- `zero <Hz>` subtracts that out. Earlier testing with a
-32Ohm resistor looked identical to a dead short, which is correct (32Ohm
-is well within the noise floor of a ~2kOhm baseline), not a bug -- if
-you're validating against a known resistor, use something clearly bigger
-than the baseline (a few kOhm or more) or the difference won't be visible
-until after `zero`ing.
+Earlier testing at 50 kHz recorded about 22 kOhm uncalibrated for a
+20 kOhm resistor, consistent with an approximately 2 kOhm series baseline.
+A 32 Ohm resistor was indistinguishable from a short in that setup. Those
+observations predate the current gain/timing settings and do not establish
+the current noise floor; recheck known loads after changing configuration.
 
 Not yet checked: a separate sweep test on `../measure-2wire-bioz/` (`start`,
 `SweepEn=bTRUE`, the same underlying `bioz_2wire.c`) showed a glitch right
@@ -127,19 +119,19 @@ i.e. a known short) and subtracts it per sweep point.
 This firmware does the same thing, adapted for a single fixed frequency
 instead of a 40-point sweep: `zero <Hz>` runs the same measurement path as
 `start <Hz>` with a known-zero load (a short, or whatever your S1-bank
-equivalent is) in place, averages `ZERO_SAMPLES` (200, ~1s at 200Hz) live
-samples into one baseline `fImpCar_Type` instead of trusting a single
-reading, then stores it alongside the frequency it was captured at.
-`ZERO_SAMPLES` was raised from 10 to 200 alongside the DFTNUM_512 speedup
-below -- each individual sample is noisier now, so averaging more of them
-for the one-time baseline capture buys back some of that lost precision. A
-later `start <Hz>` at that *same* frequency subtracts the baseline from
-every sample before printing; a `start` at a different frequency, or
-before any `zero` has run, prints the raw uncalibrated reading instead,
-tagged `(uncalibrated -- run 'zero <Hz>' first)` so it's obvious from the
-log which mode you're in. Only one baseline is kept at a time (not a table
-indexed by frequency like the sweep version) -- rerunning `zero` at a new
-frequency replaces it.
+equivalent is) in place, and averages `ZERO_SAMPLES` (200) live samples into
+one complex baseline. Capture duration depends on actual sample throughput
+and includes initialization/calibration overhead; it is not fixed at one
+second. Wait for the plain-text calibration-complete message before changing
+the load.
+
+A later `start <Hz>` at that same frequency subtracts the baseline from every
+sample and sets bit 0 of the binary frame's flags. With no matching baseline,
+the firmware sends raw impedance with that bit cleared; the GUI adds an
+uncalibrated annotation to its decoded log. Only one baseline is retained,
+and another zero replaces it. It survives `stop`/`start` and the AD5940
+reset performed between runs, but is lost when the MCU is reset or powered
+off.
 
 Practical implication: `zero`/`start` must be run at the *exact* same `Hz`
 value to have the baseline apply -- `zero 50000` then `start 50000.0` would
@@ -155,10 +147,11 @@ than an error.
 3. USB cable from the ADICUP3029's DAPLink port to your computer (both
    flashes the board and carries the UART over the same virtual COM port).
 
-Measurement parameters in `main.c`'s `TimeSeriesStructInit()` (RCAL =
-10kOhm, CE0/AIN1 switch matrix, RTIA = 1kOhm) match
-`../measure-2wire-bioz/`'s `BIOZStructInit()` exactly. If you swap in a
-different RCAL resistor value on your board, update `cfg->RcalVal` to
+Current parameters in [`TimeSeriesStructInit()`](main.c) are RCAL =
+10 kOhm, CE0/AIN1 routing, RTIA = 5 kOhm, and `DacVoltPP = 800` mV
+(with x2 excitation-buffer gain and x1 DAC gain). These differ from the
+2-wire sweep firmware's settings. If you swap in a different RCAL resistor
+value on your board, update `cfg->RcalVal` to
 match, or every reported impedance will be off by that ratio.
 
 ## Build
@@ -183,34 +176,24 @@ not executing until you either hit reset or replug the USB cable.
 
 ## Read the output
 
-The DAPLink virtual COM port carries UART0 at **230400 baud, 8N1**:
+The DAPLink virtual COM port carries UART0 at **230400 baud, 8N1**.
+Use the [GUI quick start](../README.md#quick-start) to decode and plot samples
+or record them to CSV. Select `time-series-bioz-2wire` to expose its controls.
 
-```
-picocom -b 230400 /dev/ttyACM0
-```
+For your own serial client, send newline-terminated commands in this order:
 
-(adjust the device node to match your system; `screen /dev/ttyACM0
-230400` works too). Expect a build banner, then a prompt for `zero
-<Hz>`/`start <Hz>`. With a short in place:
+1. With a known short connected, send `zero 50000` and wait for the
+   plain-text `Zero calibration captured...` message.
+2. Replace the short with the device under test and send `start 50000`.
+3. Decode the incoming **16-byte binary frames** using the
+   [shared UART protocol](../README.md#uart-protocol-reference).
+4. Send `stop` to end streaming and return to the command prompt.
 
-```
-zero 50000
-Zero calibration captured at 50000.0Hz: Z=(1998.41,-215.30)ohm, averaged over 200 samples.
-```
-
-Then swap in the device under test and, at the *same* frequency, one line
-per sample once running:
-
-```
-start 50000
-sample=0 freq=50000.0Hz Z=(20124.31,-1832.02)ohm |Z|=20207.68ohm phase=-5.20deg
-sample=1 freq=50000.0Hz Z=(20089.90,-1811.88)ohm |Z|=20170.20ohm phase=-5.15deg
-...
-```
-
-Skip `zero` and `start` prints the raw, uncalibrated reading instead
-(device under test + RLIMIT + isolation-cap impedance), tagged
-`(uncalibrated -- run 'zero <Hz>' first)`. Type `stop` to end either run.
+Boot banners, prompts, and calibration status are text. Measurement samples
+are binary, so a terminal such as picocom will not display readable sample
+lines. The GUI reconstructs readable lines from those frames. Skipping zero
+or starting at a different frequency produces raw measurements with the
+baseline flag cleared. The sample counter starts at zero on each new run.
 
 ## Layout
 
@@ -223,7 +206,7 @@ Skip `zero` and `start` prints the raw, uncalibrated reading instead
   watchdog, clock, SPI0, UART0, plus the Cortex-M3 core's SysTick).
 - `main.c` -- MCU clock/UART bring-up, AD5940 platform config, the
   `zero <Hz>`/`start <Hz>`/`stop` command loop, the zero-baseline capture
-  and subtraction, and per-sample printing.
+  and subtraction, and binary sample output.
 - `startup.c` -- vector table, reset handler, and the `_sbrk`/`_write`
   newlib retargeting.
 - `linker.ld` -- flash/SRAM memory map, including the same
